@@ -1,0 +1,162 @@
+---
+title: "KeyMethods used in the baseline paper"
+output: html_document
+---
+This is a personal document to demonstrate the key methods used in the paper with code snippets.  
+<http://nature.com/articles/s41591-020-0769-8>
+
+## Predictive performace using ROC (pROC R package) and AUC
+
+ROC step:
+1. Firstly fit a logistic regression (e.g. Response ~ CD38hi) and use the built model (fitted values) to compute True Positve Rate (TPR) and False Positive Rate (FPR) at various thresholds (from 0 to 1)  
+-> Remember **Sensitivity**, **Specificity**, **False Positive Rate** can be calculated as  
+(From a binary classification confusion matrix):  
+
+Sensitivity = (True Positive) / (True Positive + False Negative (Type 2 Error)) = True Positive Rate (TPR)  
+Specificity = (True Negative) / (True Negative + False Positive (Type 1 Error)) = True Negative Rate (TNR)  
+False Positive Rate = 1 - Specificity  
+  
+-> The resulting plot (TPR vs FPR) represents the ROC plot (AUC tells how good the model is)
+
+2. To get a p-value, a random permutation test is used - first permute the 'CD38hi' feature. So the original relationship with the 'Response' no longer exists.  
+
+Then, ROC is constructed for each permutation (e.g. 1000 permutations) and AUCs are stored.
+
+```{r setup, include=FALSE}
+
+## df = A dataframe consist of:
+##    1. timepoints (-7, 0, 70 baseline timepoints)
+##    2. CD38hi %
+##    3. Response (high, low)
+##    4. Subjects
+
+roc.df = data.frame()
+df.text = data.frame()
+N_perm = 1000
+for (tp in c(0,-7,70)) {
+  r = roc(Response~CD38hi, data=dplyr::filter(df,time==tp), direction="<", quiet = T)
+  set.seed(123)
+  r.null = vector("numeric", N_perm)
+  for(i in 1:N_perm) {
+    # iperm = sample(nrow(df))
+    r.null[i] = roc(Response~sample(CD38hi), data=dplyr::filter(df,time==tp), direction="<", quiet = T)$auc
+  }
+  r.p = sum(r.null > r$auc) / N_perm # This calculates the p-value from the distribution derived from the random permutation (n = 1000)
+  r.df = data.frame(day=paste0("day ",tp), Specificity = r$specificities, Sensitivity=r$sensitivities) %>%
+    arrange(Sensitivity)
+  roc.df = rbind(roc.df, r.df)
+  
+  df.text = rbind(df.text, 
+                  data.frame(day=paste0("day ",tp), label=sprintf("AUC = %.2f\np = %.2g",r$auc,r.p)))
+}
+df.text$x = rep(0.25,3)
+df.text$y = rep(0.1,3)
+df.text = df.text %>% 
+  mutate(day = factor(day, levels=levels(roc.df$day)))
+
+## roc.df holds the specificties and sensitivities for all 3 baseline timepoints (0, 7, 70)
+
+```
+
+## ANOVA to test temporal stability for each genes
+
+1. For each gene and all the subjects (-7, 0 70 timepoints)  
+2. ANOVA test: Within the group variance (SSW) + between the group variance (SSB) = total variance.  
+3. Ratio - F - statistic (SSB/SSW) and p-values are computed.  
+4. Finally, p-values are adjusted.  
+
+```{r}
+
+# stability calculation
+ss = matrix(NA,nrow(dat), 2, dimnames=list(rownames(dat),c("ISV","WSV"))) # Intra-subject variation (ISV) & Within-subject variation (WSV)
+pv = rep(NA,nrow(dat))
+names(pv) = rownames(dat)
+for (i in 1:nrow(dat)) {
+  tmp = info %>% dplyr::select(subject) %>% mutate(value=dat[i, ])
+  fit = aov(value~subject, data=tmp)
+  ss[i,] = summary(fit)[[1]]["Sum Sq"][[1]]
+  pv[i] = summary(fit)[[1]]["Pr(>F)"][[1]][1]
+}
+
+pv.bh = p.adjust(pv, "BH")
+pv.bonf = p.adjust(pv, "bonferroni")
+ssn = ss / rowSums(ss)
+
+fn.ssn = file.path(PROJECT_DIR, "generated_data", "CHI", "CHI_genes_stability.txt")
+
+ssn %>% as.data.frame() %>% tibble::rownames_to_column("gene") %>% 
+  mutate(pv = pv, pv.BH=pv.bh, pv.Bonf=pv.bonf) %>% 
+  fwrite(fn.ssn, sep="\t", col.names=T, row.names=F, quote=F)
+
+```
+
+## Correlation of temporal stable genes and CD38hi B cells
+
+1. To get the robust correlation, correlations are calculated for multiple iterations.    
+2. Per iteration, one unique pair of samples is removed and correlation (Speaman's rank correlation) is calculated.  
+3. Iteration is over when all the unique pairs have been removed.  
+4. Parameters that we are interested are calculated from the correlation values (e.g. mean, sd, correlation coefficient (mean/sd))
+
+In this paper, this was done using:  
+  a) temporal stable genes (ISV > 0.75)
+  b) all genes + repeat 500 times (for random signatures)
+  
+** select top 'n' genes based on the correlation coefficients and plot ROCs (response ~ avg z-score of the top n genes) to get AUC 
+using a) temporal stable genes and b) all genes (for all 500 random iterations) to generate a null distribution
+
+```{r}
+
+# dat = gene-expression matrix that only contains temporal-stable genes
+
+ns = 2
+cmb = combn(1:nrow(info), ns) # cmb is all the combinations of different pairs
+# cc.rob = matrix(NA,nrow=nrow(edat.gene),ncol=ncol(cmb))
+
+cc.rob = matrix(NA,nrow=sum(gidx),ncol=ncol(cmb))
+
+for (ic in 1:ncol(cmb)) {
+  cat(ic," ")
+  ridx = cmb[,ic]
+  cc.rob[,ic] = cor(t(dat[gidx,-ridx]), info$CD38hi[-ridx], method="spearman", use="pairwise.complete.obs")
+  # correlation = (~720 genes x 22 samples , 22 samples CD38Hi values) -> 1D array (correlations for each gene)
+}
+rownames(cc.rob) = rownames(dat)[gidx]
+# columns of the cc.rob represent all the correlation structures calculated above
+
+cc.rob.rank = apply(-cc.rob,2,rank)
+# -cc.rob so rank() function gives the most positive correlated value -> 1
+
+ntop = 20
+cc.rob.ntop = rowSums(cc.rob.rank <= ntop)
+# How many correlations structures have genes that are ranked in the top 20?
+
+cc.rob.mean = apply(cc.rob,1,mean) # gene-wise mean correlation
+cc.rob.median = apply(cc.rob,1,median) # gene-wise median correlation
+cc.rob.sd = apply(cc.rob,1,sd) # gene-wise SD correlation
+cc.rob.1cv = cc.rob.mean / cc.rob.sd # gene-wise CV correlation
+cc.rob.ntop.rank = rank(cc.rob.ntop)
+
+cc.rob.1cv.ord = order(cc.rob.1cv,decreasing = T)
+cc.rob.1cv.sort = sort(cc.rob.1cv,decreasing = T)
+head(cc.rob.1cv.sort, 10)
+
+# calculate AUC for each gene
+auc.one=matrix(nrow=nrow(dat.ts), ncol=3)
+for (k in 1:nrow(dat.ts)) {
+  X = dat.ts[k,]
+  Y = info$Response
+  auc.one[k, c(2,1,3)] = ci.auc(Y,X,direction="<", quiet=T)
+}
+rownames(auc.one) = rownames(dat.ts)
+colnames(auc.one) = c("auc.gene", "auc.ci95.min", "auc.ci95.max")
+
+# output
+df.out = data.frame(cor.ntop20 = cc.rob.ntop / ncol(cmb) *100, 
+                    cor.mean = cc.rob.mean, 
+                    cor.sd = cc.rob.sd, 
+                    cor.median = cc.rob.median,
+                    cor.mean.sd.ratio = cc.rob.1cv, # correlation coefficient
+                    as.data.frame(auc.one)) %>%
+  tibble::rownames_to_column("gene")
+
+```
